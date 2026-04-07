@@ -1,0 +1,20 @@
+{
+    "name": "cde-ai",
+    "version": "1.0.0",
+    "description": "Interactive Structural Code Intelligence & Safe Refactor Simulation",
+    "private": true,
+    "scripts": {
+        "dev": "pnpm -r run dev",
+        "install:all": "pnpm install -r",
+        "build": "pnpm --filter cde-ai-client run build && pnpm --filter cde-ai-server run build"
+    },
+    "devDependencies": {
+        "concurrently": "^8.2.2"
+    },
+    "license": "MIT",
+    "pnpm": {
+        "overrides": {
+            "three": "0.169.0"
+        }
+    }
+}

@@ -1,0 +1,41 @@
+{
+    "name": "cde-ai-server",
+    "version": "1.0.0",
+    "private": true,
+    "scripts": {
+        "dev": "node -r ts-node/register/transpile-only src/index.ts",
+        "build": "tsc --skipLibCheck && node -e \"const fs=require('fs');fs.mkdirSync('dist',{recursive:true});fs.copyFileSync('src/landing.html','dist/landing.html');\"",
+        "start": "node dist/index.js"
+    },
+    "dependencies": {
+        "@anthropic-ai/sdk": "^0.78.0",
+        "@babel/parser": "^7.24.0",
+        "@babel/traverse": "^7.24.0",
+        "@babel/types": "^7.24.0",
+        "@cerebras/cerebras_cloud_sdk": "^1.64.1",
+        "@google/generative-ai": "^0.24.1",
+        "@modelcontextprotocol/sdk": "^1.27.1",
+        "adm-zip": "^0.5.10",
+        "cde-ai": "file:..",
+        "cookie-parser": "^1.4.7",
+        "cors": "^2.8.5",
+        "dotenv": "^17.3.1",
+        "express": "^4.18.2",
+        "groq-sdk": "^1.1.1",
+        "multer": "^1.4.5-lts.1",
+        "node-fetch": "^2.7.0",
+        "openai": "^6.29.0",
+        "ts-node": "^10.9.2",
+        "zod": "^4.3.6"
+    },
+    "devDependencies": {
+        "@types/adm-zip": "^0.5.7",
+        "@types/babel__traverse": "^7.20.5",
+        "@types/cors": "^2.8.17",
+        "@types/express": "^4.17.21",
+        "@types/multer": "^1.4.11",
+        "@types/node": "^20.11.0",
+        "ts-node-dev": "^2.0.0",
+        "typescript": "^5.4.5"
+    }
+}

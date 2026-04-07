@@ -1,0 +1,16 @@
+{
+  "$schema": "https://railway.app/schema.json",
+  "build": {
+    "builder": "NIXPACKS",
+    "buildPack": "node",
+    "nodeVersion": "22"
+  },
+  "deploy": {
+    "numReplicas": 1,
+    "healthcheckPath": "/health",
+    "healthcheckPort": 3001,
+    "healthcheckTimeout": 180,
+    "restartPolicyType": "always",
+    "restartPolicyMaxRetries": 15
+  }
+}

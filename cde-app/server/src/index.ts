@@ -1,0 +1,2021 @@
+import dotenv from "dotenv";
+dotenv.config();
+
+import express from "express";
+import fs from "fs/promises";
+import os from "os";
+import path from "path";
+import cors from "cors";
+import multer from "multer";
+import cookieParser from "cookie-parser";
+import AdmZip from "adm-zip";
+import Cerebras from "@cerebras/cerebras_cloud_sdk";
+import Groq from "groq-sdk";
+import fetch from "node-fetch";
+import OpenAI from "openai";
+import Anthropic from "@anthropic-ai/sdk";
+import { buildGraph, GraphData } from "./graph-builder";
+import { getGraph, setGraph } from "./graph-store";
+import { startMCPServer } from "./mcp-server";
+import { parseGitHubRepoUrl, listFiles, getFileContent, updateFile, createBranch, createPullRequest } from "./github";
+
+const app = express();
+app.use(cookieParser());
+const PORT = process.env.PORT || 3001;
+console.log(`Server starting on port ${PORT}`);
+
+const getGroqClient = () => new Groq({ apiKey: process.env.GROQ_API_KEY });
+const getCerebrasClient = () => new Cerebras({ apiKey: process.env.CEREBRAS_API_KEY });
+
+const MAX_FILE_BYTES = 2 * 1024 * 1024;
+const MAX_SOURCE_FILES = 2500;
+const MAX_TOTAL_SOURCE_BYTES = 25 * 1024 * 1024;
+const MAX_UPLOAD_BYTES = 500 * 1024 * 1024;
+const GITHUB_DOWNLOAD_TIMEOUT_MS = 30_000;
+const fileCache = new Map<string, string>();
+
+interface ProcessDefinition {
+  name: string;
+  steps: number;
+  entryPoint: string;
+  explanation: string;
+  mermaid: string;
+}
+
+interface ReportStats {
+  totalFiles: number;
+  totalFunctions: number;
+  mostConnectedComponent: string;
+  mostConnectedDegree: number;
+  deepestDependencyChain: string;
+  deepestDependencyDepth: number;
+}
+
+interface AgentCardResponse {
+  title: string;
+  icon: string;
+  content: string;
+}
+
+interface AgentAnalysisResponse {
+  agents: {
+    security: AgentCardResponse;
+    architecture: AgentCardResponse;
+    performance: AgentCardResponse;
+    quality: AgentCardResponse;
+    onboarding: AgentCardResponse;
+  };
+  generatedAt: string;
+}
+
+interface LLMProvider {
+  name: string;
+  isConfigured: boolean;
+  call: () => Promise<string>;
+}
+
+type LLMProviderKey = "auto" | "openai" | "anthropic" | "glm" | "asione" | "cerebras" | "groq" | "custom";
+
+interface LLMConfigPayload {
+  provider: string;
+  apiKey: string;
+  model: string;
+  baseUrl?: string;
+}
+
+interface CustomLLMConfig {
+  provider: Exclude<LLMProviderKey, "auto">;
+  apiKey: string;
+  model: string;
+  baseUrl?: string;
+}
+
+interface LLMCompletionResponse {
+  choices?: Array<{
+    message?: {
+      content?: string | null;
+    };
+  }>;
+}
+
+interface LLMCallResult {
+  content: string;
+  provider: string;
+}
+
+interface LLMCallOptions {
+  primaryTemperature?: number;
+  primaryReasoning?: boolean;
+  maxTokens?: number;
+}
+
+interface SourceFile {
+  path: string;
+  content: string;
+}
+
+class CloneValidationError extends Error {}
+class CloneTimeoutError extends Error {}
+class CloneAccessError extends Error {}
+class CloneTooLargeError extends Error {}
+
+function isSmallCodebase(graphData: GraphData): boolean {
+  return graphData.nodes.length < 200;
+}
+
+function hasValidGroqApiKey(): boolean {
+  const apiKey = process.env.GROQ_API_KEY || "";
+  return !!apiKey && apiKey !== "PASTE_YOUR_KEY_HERE" && apiKey !== "your_actual_key_here";
+}
+
+function hasValidCerebrasApiKey(): boolean {
+  const apiKey = process.env.CEREBRAS_API_KEY || "";
+  return !!apiKey && apiKey !== "PASTE_YOUR_KEY_HERE" && apiKey !== "your_key_here";
+}
+
+function hasValidGlmApiKey(): boolean {
+  const apiKey = process.env.GLM_API_KEY || "";
+  return !!apiKey && apiKey !== "PASTE_YOUR_KEY_HERE" && apiKey !== "your_key_here";
+}
+
+function hasValidAsiOneApiKey(): boolean {
+  const apiKey = process.env.ASI_ONE_API_KEY || "";
+  return !!apiKey && apiKey !== "PASTE_YOUR_KEY_HERE" && apiKey !== "your_key_here";
+}
+
+function getActiveProviderOrder(): Array<"glm" | "asione" | "cerebras"> {
+  return ["glm", "asione", "cerebras"];
+}
+
+function isLLMProviderKey(value: string): value is LLMProviderKey {
+  return ["auto", "openai", "anthropic", "groq", "cerebras", "custom"].includes(value);
+}
+
+function formatProviderName(provider: string): string {
+  const labels: Record<string, string> = {
+    auto: "Auto",
+    openai: "OpenAI",
+    anthropic: "Anthropic",
+    groq: "Groq",
+    cerebras: "Cerebras",
+    custom: "Custom",
+  };
+
+  return labels[provider] ?? provider;
+}
+
+function normalizeLLMConfig(config?: Partial<LLMConfigPayload> | null): CustomLLMConfig | null {
+  const providerValue = (config?.provider ?? "").trim().toLowerCase();
+  if (!isLLMProviderKey(providerValue) || providerValue === "auto") {
+    return null;
+  }
+
+  const apiKey = config?.apiKey?.trim() ?? "";
+  if (!apiKey) {
+    return null;
+  }
+
+  const defaultModels: Record<Exclude<LLMProviderKey, "auto" | "custom">, string> = {
+    openai: "gpt-4o",
+    anthropic: "claude-sonnet-4-5",
+    glm: "glm-5",
+    asione: "asi1",
+    cerebras: "llama3.1-8b",
+    groq: "llama-3.3-70b-versatile",
+  };
+
+  const incomingModel = config?.model?.trim() ?? "";
+  const model =
+    providerValue === "custom"
+      ? incomingModel
+      : incomingModel || defaultModels[providerValue];
+
+  if (!model) {
+    return null;
+  }
+
+  return {
+    provider: providerValue,
+    apiKey,
+    model,
+    baseUrl: config?.baseUrl?.trim() || undefined,
+  };
+}
+
+export async function callLLM(
+  systemPrompt: string,
+  userMessage: string,
+  options: LLMCallOptions = {},
+): Promise<LLMCallResult> {
+  const glmPrompt = systemPrompt.trim()
+    ? `${systemPrompt.trim()}\n\n${userMessage}`
+    : userMessage;
+
+  const providerMap: Record<"glm" | "groq" | "cerebras" | "asione", LLMProvider> = {
+    glm: {
+      name: "GLM-5",
+      isConfigured: hasValidGlmApiKey(),
+      call: async () => {
+        const response = await fetch("https://api.z.ai/api/paas/v4/chat/completions", {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            Authorization: `Bearer ${process.env.GLM_API_KEY}`,
+          },
+          body: JSON.stringify({
+            model: "glm-5",
+            messages: [{ role: "user", content: glmPrompt }],
+            max_tokens: options.maxTokens ?? 4000,
+          }),
+        });
+
+        if (!response.ok) {
+          const errorText = await response.text();
+          throw new Error(`HTTP ${response.status}: ${errorText || "GLM request failed"}`);
+        }
+
+        const data = (await response.json()) as LLMCompletionResponse;
+        return data.choices?.[0]?.message?.content ?? "";
+      },
+    },
+    asione: {
+      name: "ASI:One",
+      isConfigured: hasValidAsiOneApiKey(),
+      call: async () => {
+        const response = await fetch("https://api.asi1.ai/v1/chat/completions", {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            Authorization: `Bearer ${process.env.ASI_ONE_API_KEY}`,
+          },
+          body: JSON.stringify({
+            model: "asi1",
+            messages: [
+              { role: "system", content: systemPrompt },
+              { role: "user", content: userMessage },
+            ],
+            max_tokens: options.maxTokens ?? 4000,
+            temperature: options.primaryTemperature ?? 0.3,
+          }),
+        });
+
+        if (!response.ok) {
+          const errorText = await response.text();
+          throw new Error(`HTTP ${response.status}: ${errorText || "ASI:One request failed"}`);
+        }
+
+        const data = (await response.json()) as LLMCompletionResponse;
+        return data.choices?.[0]?.message?.content ?? "";
+      },
+    },
+    groq: {
+      name: "Groq",
+      isConfigured: hasValidGroqApiKey(),
+      call: async () => {
+        const res = await getGroqClient().chat.completions.create({
+          model: "llama-3.3-70b-versatile",
+          messages: [
+            { role: "system" as const, content: systemPrompt },
+            { role: "user" as const, content: userMessage },
+          ],
+          max_tokens: options.maxTokens ?? 2048,
+          ...(typeof options.primaryTemperature === "number"
+            ? { temperature: options.primaryTemperature }
+            : { temperature: 0.3 }),
+        });
+        return (res as LLMCompletionResponse).choices?.[0]?.message?.content ?? "";
+      },
+    },
+    cerebras: {
+      name: "Cerebras",
+      isConfigured: hasValidCerebrasApiKey(),
+      call: async () => {
+        const res = await getCerebrasClient().chat.completions.create({
+          model: "llama3.1-8b",
+          messages: [
+            { role: "system" as const, content: systemPrompt },
+            { role: "user" as const, content: userMessage },
+          ],
+          max_tokens: options.maxTokens ?? 2048,
+        });
+        return (res as LLMCompletionResponse).choices?.[0]?.message?.content ?? "";
+      },
+    },
+  };
+
+  const providers = getActiveProviderOrder().map((providerKey) => providerMap[providerKey]);
+  const failures: string[] = [];
+
+  for (const provider of providers) {
+    if (!provider.isConfigured) {
+      continue;
+    }
+
+    try {
+      console.log(`[LLM] Trying ${provider.name}...`);
+      const result = (await provider.call()).trim();
+
+      if (!result) {
+        console.warn(`[LLM] ${provider.name} returned an empty response`);
+        failures.push(`${provider.name}: empty response`);
+        continue;
+      }
+
+      console.log(`[LLM] Success with ${provider.name}`);
+      return {
+        content: result,
+        provider: provider.name,
+      };
+    } catch (err: unknown) {
+      const message = err instanceof Error ? err.message : "Unknown error";
+      failures.push(`${provider.name}: ${message}`);
+      console.warn(`[LLM] ${provider.name} failed: ${message}`);
+      continue;
+    }
+  }
+
+  if (failures.length === 0) {
+    throw new Error("All LLM providers are unavailable");
+  }
+
+  throw new Error(`All LLM providers failed: ${failures.join(" | ")}`);
+}
+
+async function callLLMWithConfig(
+  systemPrompt: string,
+  userMessage: string,
+  config: CustomLLMConfig,
+  options: LLMCallOptions = {},
+): Promise<LLMCallResult> {
+  if (config.provider === "openai" || config.provider === "custom") {
+    const client = new OpenAI({
+      apiKey: config.apiKey,
+      baseURL: config.baseUrl || "https://api.openai.com/v1",
+    });
+    const res = await client.chat.completions.create({
+      model: config.model,
+      messages: [
+        { role: "system", content: systemPrompt },
+        { role: "user", content: userMessage },
+      ],
+      max_tokens: options.maxTokens ?? 1024,
+    });
+    return {
+      content: res.choices[0]?.message?.content ?? "",
+      provider: formatProviderName(config.provider),
+    };
+  }
+
+  if (config.provider === "anthropic") {
+    const client = new Anthropic({ apiKey: config.apiKey });
+    const res = await client.messages.create({
+      model: config.model,
+      max_tokens: 1024,
+      ...(typeof options.maxTokens === "number" ? { max_tokens: options.maxTokens } : {}),
+      messages: [{ role: "user", content: userMessage }],
+      system: systemPrompt,
+    });
+    return {
+      content: (res.content[0] as { text?: string } | undefined)?.text ?? "",
+      provider: "Anthropic",
+    };
+  }
+
+  if (config.provider === "glm" || config.provider === "asione") {
+    const baseUrl = config.provider === "glm" 
+      ? "https://api.z.ai/api/paas/v4" 
+      : "https://api.asi1.ai/v1";
+    const model = config.provider === "glm" ? "glm-5" : "asi1";
+    
+    const response = await fetch(`${baseUrl}/chat/completions`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${config.apiKey}`,
+      },
+      body: JSON.stringify({
+        model: config.model || model,
+        messages: [
+          { role: "system", content: systemPrompt },
+          { role: "user", content: userMessage },
+        ],
+        max_tokens: options.maxTokens ?? 1024,
+      }),
+    });
+
+    if (!response.ok) {
+      throw new Error(`${config.provider.toUpperCase()} API error: ${response.status}`);
+    }
+
+    const data = (await response.json()) as LLMCompletionResponse;
+    return {
+      content: data.choices?.[0]?.message?.content ?? "",
+      provider: config.provider.toUpperCase(),
+    };
+  }
+
+  if (config.provider === "groq") {
+    const client = new Groq({ apiKey: config.apiKey });
+    const res = await client.chat.completions.create({
+      model: config.model,
+      messages: [
+        { role: "system", content: systemPrompt },
+        { role: "user", content: userMessage },
+      ],
+      max_tokens: options.maxTokens ?? 1024,
+    });
+    return {
+      content: (res as LLMCompletionResponse).choices?.[0]?.message?.content ?? "",
+      provider: "Groq",
+    };
+  }
+
+  if (config.provider === "cerebras") {
+    const client = new Cerebras({ apiKey: config.apiKey });
+    const res = await client.chat.completions.create({
+      model: config.model,
+      messages: [
+        { role: "system", content: systemPrompt },
+        { role: "user", content: userMessage },
+      ],
+      max_tokens: options.maxTokens ?? 1024,
+    });
+    return {
+      content: (res as LLMCompletionResponse).choices?.[0]?.message?.content ?? "",
+      provider: "Cerebras",
+    };
+  }
+
+  if (config.provider === "groq") {
+    const client = new Groq({ apiKey: config.apiKey });
+    const res = await client.chat.completions.create({
+      model: config.model,
+      messages: [
+        { role: "system", content: systemPrompt },
+        { role: "user", content: userMessage },
+      ],
+      max_tokens: options.maxTokens ?? 1024,
+    });
+    return {
+      content: (res as LLMCompletionResponse).choices?.[0]?.message?.content ?? "",
+      provider: "Groq",
+    };
+  }
+
+  throw new Error(`Unknown provider: ${config.provider}`);
+}
+
+async function callAgentWithFallback(systemPrompt: string, userMessage: string): Promise<string> {
+  const fallback = await callLLM(systemPrompt, userMessage, {
+    primaryTemperature: 0.2,
+    maxTokens: 1024,
+  });
+  return fallback.content;
+}
+
+function buildCompactGraphSummary(graphData: GraphData): string {
+  const nodeDegree = new Map<string, number>();
+  graphData.edges.forEach((edge) => {
+    nodeDegree.set(edge.source, (nodeDegree.get(edge.source) || 0) + 1);
+    nodeDegree.set(edge.target, (nodeDegree.get(edge.target) || 0) + 1);
+  });
+
+  const isLarge = graphData.nodes.length > 100;
+  const filteredNodes = isLarge
+    ? graphData.nodes.filter(
+        (node) =>
+          node.type === "file" ||
+          node.type === "doc" ||
+          node.type === "class" ||
+          (nodeDegree.get(node.id) || 0) > 2,
+      )
+    : graphData.nodes;
+
+  const filteredNodeIds = new Set(filteredNodes.map((node) => node.id));
+  const filteredEdges = graphData.edges.filter(
+    (edge) => filteredNodeIds.has(edge.source) && filteredNodeIds.has(edge.target),
+  );
+
+  const idToLabel = new Map<string, string>();
+  graphData.nodes.forEach((node) => {
+    idToLabel.set(node.id, node.label || node.id);
+  });
+
+  const nodeSummaries = filteredNodes.map(
+    (node) =>
+      `id: ${node.id} | label: ${node.label} | type: ${node.type} | file: ${node.filePath}`,
+  );
+  const edgeSummaries = filteredEdges.map((edge) => {
+    const sourceLabel = idToLabel.get(edge.source) || edge.source;
+    const targetLabel = idToLabel.get(edge.target) || edge.target;
+    return `${sourceLabel} --${edge.kind}--> ${targetLabel}`;
+  });
+
+  let summary = "NODES:\n";
+  summary += nodeSummaries.length > 0 ? nodeSummaries.join("\n") : "None";
+  summary += "\n\nEDGES:\n";
+  summary += edgeSummaries.length > 0 ? edgeSummaries.join("\n") : "None";
+
+  if (summary.length > 12000) {
+    summary = summary.substring(0, 12000) + "... [truncated]";
+  }
+
+  return summary;
+}
+
+function extractMermaidLabels(mermaid: string): string[] {
+  const matches = mermaid.match(/\[[^\]]+\]/g) || [];
+  return matches.map((match) => match.slice(1, -1).trim()).filter(Boolean);
+}
+
+function sanitizeProcesses(
+  raw: unknown,
+  allowedLabels: Set<string>,
+  minimumSteps: number,
+  focusNode?: string,
+): ProcessDefinition[] {
+  if (!Array.isArray(raw)) return [];
+
+  return raw
+    .map((item) => {
+      if (!item || typeof item !== "object") return null;
+
+      const candidate = item as Partial<ProcessDefinition>;
+      const name = typeof candidate.name === "string" ? candidate.name.trim() : "";
+      const entryPoint =
+        typeof candidate.entryPoint === "string" ? candidate.entryPoint.trim() : "";
+      const explanation =
+        typeof candidate.explanation === "string" ? candidate.explanation.trim() : "";
+      const mermaid = typeof candidate.mermaid === "string" ? candidate.mermaid.trim() : "";
+      const steps =
+        typeof candidate.steps === "number" && Number.isFinite(candidate.steps)
+          ? Math.max(0, Math.floor(candidate.steps))
+          : 0;
+
+      const labels = extractMermaidLabels(mermaid);
+      const hasOnlyKnownLabels =
+        labels.length >= minimumSteps && labels.every((label) => allowedLabels.has(label));
+      const hasFocusNode = !focusNode || labels.includes(focusNode);
+
+      if (
+        !name ||
+        !explanation ||
+        !mermaid ||
+        steps < minimumSteps ||
+        !hasOnlyKnownLabels ||
+        !hasFocusNode
+      ) {
+        return null;
+      }
+
+      return {
+        name,
+        steps,
+        entryPoint: entryPoint || labels[0] || name,
+        explanation,
+        mermaid,
+      };
+    })
+    .filter((process): process is ProcessDefinition => process !== null);
+}
+
+const PROCESS_EDGE_KINDS = new Set(["CALLS", "IMPORTS", "DEFINES"]);
+const PROCESS_KEYWORDS = [
+  "app",
+  "main",
+  "index",
+  "start",
+  "init",
+  "load",
+  "fetch",
+  "query",
+  "route",
+  "api",
+  "render",
+  "view",
+  "page",
+  "screen",
+  "upload",
+  "create",
+  "update",
+  "handle",
+  "submit",
+];
+
+function sanitizeMermaidLabel(label: string): string {
+  return label.replace(/[[\]"]/g, "").trim() || "Unknown";
+}
+
+function detectHeuristicProcesses(
+  graphData: GraphData,
+  minimumSteps: number,
+  focusNode?: string,
+): ProcessDefinition[] {
+  const nodeById = new Map(graphData.nodes.map((node) => [node.id, node]));
+  const outgoing = new Map<string, string[]>();
+  const incoming = new Map<string, string[]>();
+
+  graphData.nodes.forEach((node) => {
+    outgoing.set(node.id, []);
+    incoming.set(node.id, []);
+  });
+
+  graphData.edges.forEach((edge) => {
+    if (!PROCESS_EDGE_KINDS.has(edge.kind)) return;
+    outgoing.get(edge.source)?.push(edge.target);
+    incoming.get(edge.target)?.push(edge.source);
+  });
+
+  const scoreNode = (nodeId: string): number => {
+    const node = nodeById.get(nodeId);
+    if (!node) return 0;
+    const label = node.label.toLowerCase();
+    const keywordScore = PROCESS_KEYWORDS.reduce(
+      (sum, keyword) => sum + (label.includes(keyword) ? 6 : 0),
+      0,
+    );
+    const typeScore = node.type === "file" ? 8 : node.type === "function" || node.type === "method" ? 5 : 3;
+    return (
+      keywordScore +
+      typeScore +
+      (outgoing.get(nodeId)?.length ?? 0) * 3 +
+      (incoming.get(nodeId)?.length ?? 0)
+    );
+  };
+
+  const extendForward = (startId: string, maxSteps = 5): string[] => {
+    const visited = new Set<string>([startId]);
+    const path = [startId];
+    let currentId = startId;
+
+    while (path.length < maxSteps) {
+      const nextCandidates = (outgoing.get(currentId) ?? [])
+        .filter((candidateId) => !visited.has(candidateId))
+        .sort((a, b) => scoreNode(b) - scoreNode(a));
+
+      const nextId = nextCandidates[0];
+      if (!nextId) break;
+
+      path.push(nextId);
+      visited.add(nextId);
+      currentId = nextId;
+    }
+
+    return path;
+  };
+
+  const buildFocusedPath = (focusId: string, maxSteps = 5): string[] => {
+    const prefixCandidates = (incoming.get(focusId) ?? []).sort((a, b) => scoreNode(b) - scoreNode(a));
+    const prefix = prefixCandidates[0] ? [prefixCandidates[0]] : [];
+    const suffix = extendForward(focusId, maxSteps - prefix.length);
+    const combined = [...prefix, ...suffix];
+    return Array.from(new Set(combined)).slice(0, maxSteps);
+  };
+
+  const candidateIds = focusNode
+    ? graphData.nodes
+        .filter((node) => node.label === focusNode)
+        .map((node) => node.id)
+    : graphData.nodes
+        .filter((node) =>
+          ["file", "function", "method", "class", "python_function", "python_class"].includes(node.type),
+        )
+        .sort((a, b) => scoreNode(b.id) - scoreNode(a.id))
+        .slice(0, 12)
+        .map((node) => node.id);
+
+  const processes: ProcessDefinition[] = [];
+  const seenSignatures = new Set<string>();
+
+  for (const candidateId of candidateIds) {
+    const pathIds = focusNode ? buildFocusedPath(candidateId) : extendForward(candidateId);
+    if (pathIds.length < minimumSteps) continue;
+
+    const pathNodes = pathIds
+      .map((nodeId) => nodeById.get(nodeId))
+      .filter((node): node is NonNullable<typeof node> => !!node);
+
+    if (pathNodes.length < minimumSteps) continue;
+    if (focusNode && !pathNodes.some((node) => node.label === focusNode)) continue;
+
+    const signature = pathNodes.map((node) => node.label).join(">");
+    if (seenSignatures.has(signature)) continue;
+    seenSignatures.add(signature);
+
+    const startNode = pathNodes[0];
+    const mermaidLines = ["graph TD"];
+    pathNodes.forEach((node, index) => {
+      mermaidLines.push(`  N${index}[${sanitizeMermaidLabel(node.label)}]`);
+      if (index > 0) {
+        mermaidLines.push(`  N${index - 1} --> N${index}`);
+      }
+    });
+
+    processes.push({
+      name: `${sanitizeMermaidLabel(startNode.label)} Flow`,
+      steps: pathNodes.length,
+      entryPoint: startNode.label,
+      explanation: `Heuristic flow beginning at ${startNode.label} and following the strongest reachable dependencies in the current graph.`,
+      mermaid: mermaidLines.join("\n"),
+    });
+
+    if (processes.length >= 6) break;
+  }
+
+  return processes;
+}
+
+function computeReportStats(graphData: GraphData): ReportStats {
+  const fileNodes = graphData.nodes.filter((node) => node.type === "file" || node.type === "doc");
+  const functionNodes = graphData.nodes.filter(
+    (node) =>
+      node.type === "function" ||
+      node.type === "method" ||
+      node.type === "python_function" ||
+      node.type === "python_class",
+  );
+
+  const degreeMap = new Map<string, number>();
+  graphData.nodes.forEach((node) => degreeMap.set(node.id, 0));
+  graphData.edges.forEach((edge) => {
+    degreeMap.set(edge.source, (degreeMap.get(edge.source) ?? 0) + 1);
+    degreeMap.set(edge.target, (degreeMap.get(edge.target) ?? 0) + 1);
+  });
+
+  let mostConnectedNode = graphData.nodes[0];
+  let mostConnectedDegree = mostConnectedNode ? degreeMap.get(mostConnectedNode.id) ?? 0 : 0;
+  graphData.nodes.forEach((node) => {
+    const degree = degreeMap.get(node.id) ?? 0;
+    if (!mostConnectedNode || degree > mostConnectedDegree) {
+      mostConnectedNode = node;
+      mostConnectedDegree = degree;
+    }
+  });
+
+  const adjacency = new Map<string, string[]>();
+  graphData.nodes.forEach((node) => adjacency.set(node.id, []));
+  graphData.edges.forEach((edge) => {
+    if (edge.kind === "CALLS" || edge.kind === "IMPORTS" || edge.kind === "DEFINES") {
+      adjacency.get(edge.source)?.push(edge.target);
+    }
+  });
+
+  let deepestStart: string | null = null;
+  let deepestEnd: string | null = null;
+  let deepestDepth = 0;
+
+  graphData.nodes.forEach((startNode) => {
+    const visited = new Set<string>([startNode.id]);
+    const queue: Array<{ id: string; depth: number }> = [{ id: startNode.id, depth: 0 }];
+
+    while (queue.length > 0) {
+      const current = queue.shift();
+      if (!current) continue;
+
+      if (current.depth > deepestDepth) {
+        deepestDepth = current.depth;
+        deepestStart = startNode.label;
+        deepestEnd = graphData.nodes.find((node) => node.id === current.id)?.label ?? current.id;
+      }
+
+      const neighbors = adjacency.get(current.id) ?? [];
+      neighbors.forEach((neighbor) => {
+        if (visited.has(neighbor)) return;
+        visited.add(neighbor);
+        queue.push({ id: neighbor, depth: current.depth + 1 });
+      });
+    }
+  });
+
+  return {
+    totalFiles: fileNodes.length,
+    totalFunctions: functionNodes.length,
+    mostConnectedComponent: mostConnectedNode?.label ?? "None",
+    mostConnectedDegree,
+    deepestDependencyChain:
+      deepestStart && deepestEnd
+        ? `${deepestStart} -> ${deepestEnd}`
+        : "No dependency chain detected",
+    deepestDependencyDepth: deepestDepth,
+  };
+}
+
+function resolveGraphData(fallbackGraph?: GraphData | null): GraphData | null {
+  return getGraph() || fallbackGraph || null;
+}
+
+app.use(cors({ origin: "http://localhost:5173" }));
+app.use(express.json({ limit: "500mb" }));
+app.use(express.urlencoded({ limit: "500mb", extended: true }));
+
+app.get("/health", (_req, res) => {
+  res.status(200).json({ status: "ok" });
+});
+
+app.post("/api/query", async (req, res) => {
+  console.log("Query received:", req.body.question);
+
+  const { question, graphData: requestGraphData, llmConfig } = req.body as {
+    question: string;
+    graphData?: GraphData;
+    llmConfig?: LLMConfigPayload;
+  };
+  const graphData = resolveGraphData(requestGraphData);
+
+  if (!question || !graphData) {
+    res.status(400).json({ error: "No graph loaded" });
+    return;
+  }
+
+  try {
+    const summary = buildCompactGraphSummary(graphData);
+
+    const systemPrompt = `You are an expert software architect analyzing a real codebase.
+You have been given the actual nodes and edges of a dependency graph.
+
+When answering questions, you MUST follow this exact format:
+
+CALL CHAIN (always first):
+ComponentA.tsx -> functionB() -> api.ts -> /endpoint -> parser.ts -> output
+
+EXPLANATION (2-3 sentences after the chain):
+Explain WHY each step happens, what data is passed between them,
+and what the key logic is at each step. Be specific about function
+names and file names. Write like a senior engineer explaining to
+a colleague, not like documentation.
+
+RULES:
+- Only reference files and functions that exist in the provided node list
+- Never say 'it appears' or 'seems to' - be direct and confident
+- Always show the arrow chain first before any explanation
+- If multiple call chains exist show all of them
+- Be technical and specific, not generic
+
+You MUST respond with ONLY valid JSON, no markdown, no backticks:
+{
+  "explanation": "CALL CHAIN:\\nA -> B -> C\\n\\nEXPLANATION:\\nyour text here",
+  "relevantNodes": ["nodeId1", "nodeId2", "nodeId3"]
+}`;
+
+    const userMessage = `GRAPH DATA:\n${summary}\n\nUSER QUESTION:\n${question}`;
+    const customConfig = normalizeLLMConfig(llmConfig);
+
+    let text: string;
+    let provider = "Unknown";
+    if (customConfig) {
+      try {
+        const result = await callLLMWithConfig(systemPrompt, userMessage, customConfig);
+        text = result.content;
+        provider = result.provider;
+      } catch (err: unknown) {
+        const message = err instanceof Error ? err.message : "Unknown error";
+        res.json({
+          explanation: `Your ${formatProviderName(customConfig.provider)} key returned an error: ${message}`,
+          relevantNodes: [],
+          provider: formatProviderName(customConfig.provider),
+        });
+        return;
+      }
+    } else {
+      const result = await callLLM(systemPrompt, userMessage);
+      text = result.content;
+      provider = result.provider;
+    }
+
+    try {
+      const jsonStr = text.replace(/```json\n?|```/g, "").trim();
+      const parsed = JSON.parse(jsonStr);
+      res.json({
+        explanation: parsed.explanation || "No explanation provided.",
+        relevantNodes: parsed.relevantNodes || [],
+        provider,
+      });
+    } catch (parseErr) {
+      console.error("[CDE AI] AI Parse error:", parseErr, "Raw text:", text);
+      res.json({
+        explanation: "Could not analyze codebase response. Please try again.",
+        relevantNodes: [],
+        provider,
+      });
+    }
+  } catch (err: unknown) {
+    console.error("[LLM] Query error:", err);
+    const message = err instanceof Error ? err.message : "Unknown error";
+    res.status(500).json({ explanation: `Query failed: ${message}`, relevantNodes: [], provider: "Unknown" });
+  }
+});
+
+app.post("/api/node-summary", async (req, res) => {
+  const { graphData, nodeId, label, type } = req.body as {
+    graphData: GraphData;
+    nodeId: string;
+    label: string;
+    type: string;
+  };
+
+  if (!graphData || !nodeId || !label || !type) {
+    res.status(400).json({ error: "Missing graphData, nodeId, label, or type", summary: "" });
+    return;
+  }
+
+  const node = graphData.nodes.find((candidate) => candidate.id === nodeId);
+  if (!node) {
+    res.status(404).json({ error: "Node not found in graphData", summary: "" });
+    return;
+  }
+
+  const incoming = graphData.edges
+    .filter((edge) => edge.target === nodeId)
+    .map((edge) => graphData.nodes.find((candidate) => candidate.id === edge.source)?.label ?? edge.source);
+  const outgoing = graphData.edges
+    .filter((edge) => edge.source === nodeId)
+    .map((edge) => graphData.nodes.find((candidate) => candidate.id === edge.target)?.label ?? edge.target);
+
+  try {
+    const systemPrompt = `Given this node '${label}' of type '${type}' in a codebase, write exactly one sentence describing what it likely does based on its name and connections.`;
+    const userMessage = `NODE LABEL: ${label}
+NODE TYPE: ${type}
+FILE PATH: ${node.filePath}
+INCOMING CONNECTIONS (${incoming.length}): ${incoming.length > 0 ? incoming.join(", ") : "None"}
+OUTGOING CONNECTIONS (${outgoing.length}): ${outgoing.length > 0 ? outgoing.join(", ") : "None"}
+
+Return exactly one sentence with no markdown and no bullets.`;
+    const summary = await callLLM(systemPrompt, userMessage);
+    const normalized = summary.content.replace(/\s+/g, " ").trim();
+    const sentence = normalized.split(/(?<=[.!?])\s+/)[0] ?? normalized;
+
+    res.json({ summary: sentence.trim() });
+  } catch (err: unknown) {
+    console.error("[LLM] Node summary error:", err);
+    const message = err instanceof Error ? err.message : "Unknown error";
+    res.status(500).json({ error: `Node summary failed: ${message}`, summary: "" });
+  }
+});
+
+app.post("/api/processes", async (req, res) => {
+  const { graphData: requestGraphData, focusNode } = req.body as { graphData?: GraphData; focusNode?: string };
+  const graphData = resolveGraphData(requestGraphData);
+  const minimumSteps = 3;
+
+  if (!graphData) {
+    res.status(400).json({ error: "No graph loaded" });
+    return;
+  }
+
+  try {
+    const summary = buildCompactGraphSummary(graphData);
+    const allowedLabels = new Set(graphData.nodes.map((node) => node.label));
+    const systemPrompt = `You are an expert software architect with deep reasoning capabilities.
+You have been given a complete dependency graph of a real codebase.
+
+Your task is to detect ALL meaningful processes in this codebase.
+A process is a complete execution flow from a trigger point 
+(user action, API call, event handler, entry point) through 
+every function call, all the way to a final output or side effect.
+
+Think step by step:
+
+STEP 1 - Find all entry points:
+Look for nodes that have zero or few incoming edges but many 
+outgoing edges. These are likely entry points:
+- Event handlers (onClick, onSubmit, handleX)
+- API endpoints (/api/*)
+- Main functions
+- React component mount effects
+
+STEP 2 - Trace each entry point:
+For each entry point, follow the outgoing edges through the graph.
+Map the complete execution chain until you reach leaf nodes.
+
+STEP 3 - Name each process:
+Give each process a human readable name describing what it does
+from a user perspective. Example: 'File Upload Flow' not 'handleUpload chain'
+
+STEP 4 - Generate Mermaid diagram:
+For each process create a valid Mermaid flowchart showing
+every step in the execution chain.
+
+RETURN strictly valid JSON only:
+{
+  'processes': [
+    {
+      'name': 'human readable process name',
+      'steps': number of nodes in the chain,
+      'entryPoint': 'the starting node label',
+      'explanation': 'plain english description of what this process does and why it matters',
+      'mermaid': 'graph TD\n  A[entryPoint] --> B[step2]\n  B --> C[step3]...'
+    }
+  ]
+}
+
+${focusNode ? `Focus specifically on processes that involve the node '${focusNode}'.
+Only return processes where this node appears as a step.` : ""}
+
+Rules:
+- Detect minimum 5 processes, maximum 15
+- Each process must have at least ${minimumSteps} steps
+- Only use node labels that actually exist in the provided graph
+- Never return empty processes array
+- Mermaid syntax must be valid graph TD format`;
+
+    const text = await callLLM(systemPrompt, `GRAPH DATA:\n${summary}`, {
+      maxTokens: 4096,
+    });
+
+    try {
+      const jsonStr = text.content.replace(/```json\n?|```/g, "").trim();
+      const parsed = JSON.parse(jsonStr);
+      const processes = sanitizeProcesses(
+        parsed.processes,
+        allowedLabels,
+        minimumSteps,
+        focusNode,
+      );
+      const finalProcesses =
+        processes.length > 0 ? processes : detectHeuristicProcesses(graphData, minimumSteps, focusNode);
+      console.log("Processes detected:", finalProcesses.length);
+      res.json({ processes: finalProcesses });
+    } catch (parseErr) {
+      console.error("[CDE AI] Process Parse error:", parseErr, "Raw text:", text.content);
+      const fallbackProcesses = detectHeuristicProcesses(graphData, minimumSteps, focusNode);
+      res.json({ processes: fallbackProcesses });
+    }
+  } catch (err: unknown) {
+    console.error("[LLM] Process detection error:", err);
+    try {
+      const fallbackProcesses = detectHeuristicProcesses(graphData, minimumSteps, focusNode);
+      if (fallbackProcesses.length > 0) {
+        res.json({ processes: fallbackProcesses });
+        return;
+      }
+    } catch (fallbackErr) {
+      console.error("[CDE AI] Heuristic process fallback failed:", fallbackErr);
+    }
+    const message = err instanceof Error ? err.message : "Unknown error";
+    res.status(500).json({ error: `Process detection failed: ${message}`, processes: [] });
+  }
+});
+
+app.post("/api/report", async (req, res) => {
+  const { graphData: requestGraphData } = req.body as { graphData?: GraphData };
+  const graphData = resolveGraphData(requestGraphData);
+
+  if (!graphData) {
+    res.status(400).json({ error: "No graph loaded" });
+    return;
+  }
+
+  try {
+    const summary = buildCompactGraphSummary(graphData);
+    const stats = computeReportStats(graphData);
+    const systemPrompt = `You are a senior software architect. Analyze this codebase knowledge graph and generate a comprehensive intelligence report.
+Use extended reasoning to deeply analyze this codebase.
+Think step by step before writing each section.
+
+Respond in clean markdown format with these exact sections:
+
+# Codebase Intelligence Report
+
+## Executive Summary
+2-3 sentences describing what this project does and its overall architecture.
+
+## Architecture Overview
+Describe the main architectural pattern, key layers, and how they interact.
+Reference specific files and their roles.
+
+## Component Breakdown
+For each major file/component: what it does, what it depends on,
+what depends on it.
+
+## Dependency Hotspots
+Top 5 most connected nodes - these are the riskiest to change.
+Format as: **filename** - N connections - why it matters
+
+## Risk Assessment
+Which parts of the codebase are most fragile? What would cause
+the most damage if changed? Be specific with file names.
+
+## Onboarding Guide
+If a new developer joined today, what 5 files should they read first
+and in what order? Why?
+
+## Quick Stats
+- Total files parsed
+- Total functions detected
+- Most connected component
+- Deepest dependency chain
+
+Only reference nodes that actually exist in the provided graph.
+Be specific, technical, and useful. Write like a senior engineer.`;
+
+    const text = await callLLM(
+      systemPrompt,
+      `GRAPH DATA:\n${summary}\n\nEXACT STATS:\n- Total files parsed: ${stats.totalFiles}\n- Total functions detected: ${stats.totalFunctions}\n- Most connected component: ${stats.mostConnectedComponent} (${stats.mostConnectedDegree} connections)\n- Deepest dependency chain: ${stats.deepestDependencyChain} (${stats.deepestDependencyDepth} hops)`,
+      {
+        primaryTemperature: 0.2,
+      },
+    );
+
+    res.json({ report: text.content.trim() });
+  } catch (err: unknown) {
+    console.error("Report generation error:", err);
+    const message = err instanceof Error ? err.message : "Unknown error";
+    res.status(500).json({ error: `Report generation failed: ${message}`, report: "" });
+  }
+});
+
+app.post("/api/agent-analysis", async (req, res) => {
+  const { graphData: requestGraphData } = req.body as { graphData?: GraphData };
+  const graphData = resolveGraphData(requestGraphData);
+
+  if (!graphData) {
+    res.status(400).json({ error: "No graph loaded" });
+    return;
+  }
+
+  try {
+    const graphSummary = `GRAPH DATA:\n${buildCompactGraphSummary(graphData)}`;
+
+    const securityPrompt = `You are a senior security engineer analyzing a codebase knowledge graph. Identify security concerns including:
+- Exposed API endpoints with no apparent auth
+- Functions that handle user input (potential injection points)
+- Authentication and authorization patterns
+- Dependency on external services (attack surface)
+- Hardcoded values or config exposure risks
+
+Be specific. Reference actual node names from the graph.
+Format your response as:
+RISK LEVEL: HIGH/MEDIUM/LOW
+FINDINGS:
+1. [finding with specific node name]
+2. [finding with specific node name]
+RECOMMENDATIONS:
+1. [specific actionable recommendation]`;
+
+    const architecturePrompt = `You are a senior software architect analyzing a codebase knowledge graph. Analyze the architectural quality including:
+- Circular dependencies between modules
+- Coupling and cohesion between components
+- Separation of concerns violations
+- God objects or files with too many responsibilities
+- Module boundary violations
+
+Be specific. Reference actual node names from the graph.
+Format your response as:
+ARCHITECTURE SCORE: X/10
+FINDINGS:
+1. [finding with specific node name]
+RECOMMENDATIONS:
+1. [specific actionable recommendation]`;
+
+    const performancePrompt = `You are a performance engineering expert analyzing a codebase knowledge graph. Identify performance concerns including:
+- Hot paths (most called functions based on edge count)
+- Potential bottlenecks (high in-degree nodes)
+- Functions called in loops or render cycles
+- Heavy dependency chains that add latency
+
+Be specific. Reference actual node names from the graph.
+Format your response as:
+PERFORMANCE SCORE: X/10
+HOT PATHS:
+1. [node name] - called by N nodes
+BOTTLENECKS:
+1. [specific concern]
+RECOMMENDATIONS:
+1. [specific actionable recommendation]`;
+
+    const qualityPrompt = `You are a code quality expert analyzing a codebase knowledge graph. Assess code quality including:
+- Dead code (nodes with zero incoming edges)
+- Overly connected functions (god functions)
+- Naming convention consistency
+- Test coverage gaps (functions with no test-related callers)
+- Code duplication patterns
+
+Be specific. Reference actual node names from the graph.
+Format your response as:
+QUALITY SCORE: X/10
+ISSUES FOUND:
+1. [issue with specific node name]
+DEAD CODE CANDIDATES:
+1. [node name]
+RECOMMENDATIONS:
+1. [specific actionable recommendation]`;
+
+    const onboardingPrompt = `You are a senior developer creating an onboarding guide for a new developer joining this codebase. Based on the knowledge graph:
+- Identify the 5 most important files to read first
+- Explain the core data flow in plain English
+- Identify the main entry points
+- Explain what each major module does
+- Suggest a learning path
+
+Be specific. Reference actual node names from the graph.
+Format your response as:
+START HERE:
+1. [file name] - [why]
+CORE DATA FLOW:
+[plain english explanation]
+LEARNING PATH:
+1. [step]`;
+
+    const [security, architecture, performance, quality, onboarding] =
+      await Promise.all([
+        callAgentWithFallback(securityPrompt, graphSummary),
+        callAgentWithFallback(architecturePrompt, graphSummary),
+        callAgentWithFallback(performancePrompt, graphSummary),
+        callAgentWithFallback(qualityPrompt, graphSummary),
+        callAgentWithFallback(onboardingPrompt, graphSummary),
+      ]);
+
+    const payload: AgentAnalysisResponse = {
+      agents: {
+        security: { title: "Security Analysis", icon: "🔴", content: security },
+        architecture: { title: "Architecture Review", icon: "🔵", content: architecture },
+        performance: { title: "Performance Audit", icon: "🟡", content: performance },
+        quality: { title: "Code Quality", icon: "🟢", content: quality },
+        onboarding: { title: "Onboarding Guide", icon: "⚡", content: onboarding },
+      },
+      generatedAt: new Date().toISOString(),
+    };
+
+    res.json(payload);
+  } catch (err: unknown) {
+    console.error("[multi-agent] Analysis error:", err);
+    const message = err instanceof Error ? err.message : "Unknown error";
+    res.status(500).json({ error: `Agent analysis failed: ${message}` });
+  }
+});
+
+const upload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: MAX_UPLOAD_BYTES },
+  fileFilter: (_req, file, cb) => {
+    if (file.mimetype === "application/zip" || file.originalname.endsWith(".zip")) {
+      cb(null, true);
+    } else {
+      cb(new Error("Only .zip files are accepted"));
+    }
+  },
+});
+
+function isIgnoredSourcePath(entryPath: string): boolean {
+  return /(node_modules|\.git|dist|build|\.next|coverage|vendor|target|__pycache__)\//.test(entryPath);
+}
+
+function isSupportedSourceFile(entryPath: string): boolean {
+  if (isIgnoredSourcePath(entryPath)) {
+    return false;
+  }
+
+  if (
+    /(^|\/)(package-lock\.json|package\.json|pnpm-lock\.yaml|yarn\.lock|poetry\.lock|Cargo\.lock)$/i.test(entryPath)
+  ) {
+    return false;
+  }
+
+  return /\.(js|jsx|ts|tsx|py|json|ya?ml|md)$/i.test(entryPath);
+}
+
+function normalizeRepoPath(filePath: string): string {
+  return filePath.replace(/\\/g, "/").replace(/^\.\//, "");
+}
+
+function parseGitHubRepo(input: string): { owner: string; repo: string } {
+  const trimmed = input.trim();
+  if (!trimmed) {
+    throw new CloneValidationError("Please enter a valid GitHub URL");
+  }
+
+  let parsed: URL;
+  try {
+    parsed = new URL(trimmed);
+  } catch {
+    throw new CloneValidationError("Please enter a valid GitHub URL");
+  }
+
+  const hostname = parsed.hostname.toLowerCase();
+  const pathParts = parsed.pathname.replace(/\/+$/, "").split("/").filter(Boolean);
+
+  if (
+    parsed.protocol !== "https:" ||
+    !["github.com", "www.github.com"].includes(hostname) ||
+    pathParts.length < 2
+  ) {
+    throw new CloneValidationError("Please enter a valid GitHub URL");
+  }
+
+  return {
+    owner: pathParts[0],
+    repo: pathParts[1].replace(/\.git$/i, ""),
+  };
+}
+
+function buildGithubZipUrls(owner: string, repo: string): string[] {
+  const token = process.env.GITHUB_TOKEN;
+  const authHeader = token ? { Authorization: `token ${token}` } : {};
+  
+  const branches = ['main', 'master', 'develop', 'dev', 'staging'];
+  const baseUrls = branches.map(branch => ({
+    url: `https://github.com/${owner}/${repo}/archive/refs/heads/${branch}.zip`,
+    headers: authHeader
+  }));
+  
+  const defaultUrls = [
+    `https://github.com/${owner}/${repo}/archive/refs/heads/main.zip`,
+    `https://github.com/${owner}/${repo}/archive/refs/heads/master.zip`,
+  ];
+  
+  return defaultUrls;
+}
+
+function withTimeout<T>(promise: Promise<T>, timeoutMs: number): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(() => reject(new CloneTimeoutError("Clone timed out")), timeoutMs);
+    promise
+      .then((value) => {
+        clearTimeout(timer);
+        resolve(value);
+      })
+      .catch((error) => {
+        clearTimeout(timer);
+        reject(error);
+      });
+  });
+}
+
+function processSourceFiles(sourceFiles: SourceFile[]): GraphData {
+  fileCache.clear();
+  for (const file of sourceFiles) {
+    fileCache.set(file.path, file.content);
+  }
+
+  const graphData = buildGraph(sourceFiles);
+  setGraph(graphData);
+  return graphData;
+}
+
+function collectSourceFilesFromZip(zip: AdmZip): SourceFile[] {
+  const entries = zip.getEntries();
+  const sourceFiles: SourceFile[] = [];
+  let skippedOversized = 0;
+  let skippedUnreadable = 0;
+  let skippedByBudget = 0;
+  let totalSourceBytes = 0;
+
+  for (const entry of entries) {
+    if (sourceFiles.length >= MAX_SOURCE_FILES) break;
+    if (entry.isDirectory) continue;
+
+    const entryPath = normalizeRepoPath(entry.entryName);
+    if (!isSupportedSourceFile(entryPath)) continue;
+
+    if (entry.header.size > MAX_FILE_BYTES) {
+      skippedOversized++;
+      continue;
+    }
+
+    if (totalSourceBytes + entry.header.size > MAX_TOTAL_SOURCE_BYTES) {
+      skippedByBudget++;
+      continue;
+    }
+
+    try {
+      const content = entry.getData().toString("utf-8");
+      sourceFiles.push({ path: entryPath, content });
+      totalSourceBytes += entry.header.size;
+    } catch {
+      skippedUnreadable++;
+    }
+  }
+
+  if (skippedOversized > 0 || skippedUnreadable > 0 || skippedByBudget > 0) {
+    console.warn(
+      `[CDE AI] ZIP sampled: skipped ${skippedOversized} oversized file(s) ` +
+        `(>${MAX_FILE_BYTES / 1024}KB), ${skippedUnreadable} unreadable file(s), and ${skippedByBudget} file(s) due to the parser budget. ` +
+        `Processing ${sourceFiles.length} of eligible source files.`,
+    );
+  } else {
+    console.log(`[CDE AI] Processing ${sourceFiles.length} source file(s).`);
+  }
+
+  return sourceFiles;
+}
+
+async function downloadGithubZip(owner: string, repo: string, tempZipPath: string): Promise<void> {
+  const token = process.env.GITHUB_TOKEN;
+  const authHeader = token ? { Authorization: `token ${token}` } : {};
+  const zipUrls = buildGithubZipUrls(owner, repo);
+
+  for (const zipUrl of zipUrls) {
+    try {
+      const response = await withTimeout(
+        fetch(zipUrl, { headers: authHeader }) as Promise<Response>,
+        GITHUB_DOWNLOAD_TIMEOUT_MS
+      ) as Response;
+
+      if (!response.ok) {
+        if (response.status === 404) {
+          continue;
+        }
+
+        if (response.status === 403 || response.status === 401) {
+          const rateLimitRemaining = response.headers.get('x-ratelimit-remaining');
+          if (rateLimitRemaining === '0') {
+            throw new CloneAccessError("GitHub API rate limit exceeded. Add GITHUB_TOKEN to .env for higher limits.");
+          }
+          throw new CloneAccessError("Repository not found or is private");
+        }
+
+        throw new Error(`GitHub ZIP download failed with status ${response.status}`);
+      }
+
+      const arrayBuffer = await withTimeout(response.arrayBuffer(), GITHUB_DOWNLOAD_TIMEOUT_MS);
+      const buffer = Buffer.from(arrayBuffer);
+      await fs.writeFile(tempZipPath, buffer);
+      return;
+    } catch (error) {
+      if (error instanceof CloneTimeoutError) {
+        throw new CloneTooLargeError("Repository too large, try ZIP upload instead");
+      }
+
+      if (error instanceof CloneAccessError) {
+        throw error;
+      }
+
+      const message = error instanceof Error ? error.message.toLowerCase() : "";
+      if (message.includes("aborted") || message.includes("timeout")) {
+        throw new CloneTooLargeError("Repository too large, try ZIP upload instead");
+      }
+    }
+  }
+
+  throw new CloneAccessError("Repository not found or private");
+}
+
+async function collectSourceFilesFromDirectory(rootDir: string): Promise<SourceFile[]> {
+  const sourceFiles: SourceFile[] = [];
+  let totalSourceBytes = 0;
+
+  async function walk(currentDir: string): Promise<void> {
+    const entries = await fs.readdir(currentDir, { withFileTypes: true });
+
+    for (const entry of entries) {
+      const absolutePath = path.join(currentDir, entry.name);
+      const relativePath = normalizeRepoPath(path.relative(rootDir, absolutePath));
+
+      if (entry.isDirectory()) {
+        if (relativePath && isIgnoredSourcePath(`${relativePath}/`)) {
+          continue;
+        }
+        await walk(absolutePath);
+        continue;
+      }
+
+      if (!isSupportedSourceFile(relativePath)) continue;
+
+      const stats = await fs.stat(absolutePath);
+      if (stats.size > MAX_FILE_BYTES) {
+        throw new CloneTooLargeError("Repository too large, please use ZIP upload");
+      }
+
+      if (sourceFiles.length >= MAX_SOURCE_FILES || totalSourceBytes + stats.size > MAX_TOTAL_SOURCE_BYTES) {
+        throw new CloneTooLargeError("Repository too large, please use ZIP upload");
+      }
+
+      const content = await fs.readFile(absolutePath, "utf-8");
+      sourceFiles.push({ path: relativePath, content });
+      totalSourceBytes += stats.size;
+    }
+  }
+
+  await walk(rootDir);
+  console.log(`[CDE AI] Processing ${sourceFiles.length} cloned source file(s).`);
+  return sourceFiles;
+}
+
+async function cloneGithubRepository(githubUrl: string): Promise<GraphData> {
+  const { owner, repo } = parseGitHubRepo(githubUrl);
+  const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "cde-ai-zip-"));
+  const tempZipPath = path.join(tempDir, `${repo}.zip`);
+
+  try {
+    await downloadGithubZip(owner, repo, tempZipPath);
+    const zipBuffer = await fs.readFile(tempZipPath);
+    const sourceFiles = collectSourceFilesFromZip(new AdmZip(zipBuffer));
+
+    if (sourceFiles.length === 0) {
+      throw new CloneValidationError(
+        "No supported JS, TS, Python, JSON, YAML, or Markdown files found in the repository",
+      );
+    }
+
+    return processSourceFiles(sourceFiles);
+  } catch (error) {
+    if (
+      error instanceof CloneValidationError ||
+      error instanceof CloneTimeoutError ||
+      error instanceof CloneTooLargeError
+    ) {
+      throw error;
+    }
+
+    const message = error instanceof Error ? error.message.toLowerCase() : "";
+    if (
+      message.includes("repository not found") ||
+      message.includes("authentication failed") ||
+      message.includes("could not read username") ||
+      message.includes("access denied") ||
+      message.includes("not found")
+    ) {
+      throw new CloneAccessError("Repository is private or not found");
+    }
+
+    throw error;
+  } finally {
+    await fs.unlink(tempZipPath).catch(() => undefined);
+    await fs.rm(tempDir, { recursive: true, force: true }).catch(() => undefined);
+  }
+}
+
+app.post("/api/upload", (req, res) => {
+  upload.single("file")(req, res, (uploadError: unknown) => {
+    if (uploadError instanceof multer.MulterError) {
+      if (uploadError.code === "LIMIT_FILE_SIZE") {
+        res.status(413).json({
+          error: `ZIP file is too large. Upload a file smaller than ${Math.round(MAX_UPLOAD_BYTES / (1024 * 1024))}MB.`,
+        });
+        return;
+      }
+
+      res.status(400).json({ error: `Upload failed: ${uploadError.message}` });
+      return;
+    }
+
+    if (uploadError instanceof Error) {
+      res.status(400).json({ error: uploadError.message });
+      return;
+    }
+
+    if (!req.file) {
+      res.status(400).json({ error: "No file uploaded" });
+      return;
+    }
+
+    try {
+      const sourceFiles = collectSourceFilesFromZip(new AdmZip(req.file.buffer));
+
+      if (sourceFiles.length === 0) {
+        res.status(422).json({
+          error: "No supported JS, TS, Python, JSON, YAML, or Markdown files found in the zip",
+        });
+        return;
+      }
+
+      res.json(processSourceFiles(sourceFiles));
+    } catch (err: unknown) {
+      const message = err instanceof Error ? err.message : "Unknown error";
+      console.error("[CDE AI] Upload error:", message);
+      res.status(500).json({ error: `Processing failed: ${message}` });
+    }
+  });
+});
+
+app.post("/api/clone", async (req, res) => {
+  const { githubUrl } = req.body as { githubUrl?: string };
+
+  try {
+    const graphData = await cloneGithubRepository(githubUrl ?? "");
+    res.json(graphData);
+  } catch (error) {
+    if (error instanceof CloneValidationError) {
+      res.status(400).json({ error: error.message });
+      return;
+    }
+
+    if (error instanceof CloneAccessError) {
+      res.status(404).json({ error: error.message });
+      return;
+    }
+
+    if (error instanceof CloneTooLargeError) {
+      res.status(413).json({ error: error.message });
+      return;
+    }
+
+    if (error instanceof CloneTimeoutError) {
+      res.status(408).json({ error: "Repository too large, try ZIP upload instead" });
+      return;
+    }
+
+    const message = error instanceof Error ? error.message : "Unknown error";
+    console.error("[CDE AI] Clone error:", message);
+    res.status(500).json({ error: `Processing failed: ${message}` });
+  }
+});
+
+app.use((err: unknown, _req: express.Request, res: express.Response, _next: express.NextFunction) => {
+  if (err instanceof multer.MulterError) {
+    if (err.code === "LIMIT_FILE_SIZE") {
+      res.status(413).json({
+        error: `ZIP file is too large. Upload a file smaller than ${Math.round(MAX_UPLOAD_BYTES / (1024 * 1024))}MB.`,
+      });
+      return;
+    }
+
+    res.status(400).json({ error: `Upload failed: ${err.message}` });
+    return;
+  }
+
+  const message = err instanceof Error ? err.message : "Unknown upload error";
+  console.error("[CDE AI] Unhandled server error:", message);
+  res.status(500).json({ error: `Processing failed: ${message}` });
+});
+
+app.get("/api/file", (req, res) => {
+  const filePath = req.query.path as string;
+  if (!filePath) {
+    res.status(400).json({ error: "Missing path parameter" });
+    return;
+  }
+
+  const content = fileCache.get(filePath);
+  if (content === undefined) {
+    res.status(404).json({ error: "File not found in cache" });
+    return;
+  }
+
+  res.json({ path: filePath, content });
+});
+
+app.get("/", (_req, res) => {
+  res.sendFile(path.join(__dirname, "landing.html"));
+});
+
+const GITHUB_CLIENT_ID = process.env.GITHUB_CLIENT_ID;
+const GITHUB_CLIENT_SECRET = process.env.GITHUB_CLIENT_SECRET;
+const GITHUB_REDIRECT_URI = process.env.GITHUB_REDIRECT_URI || `${process.env.APP_URL || 'http://localhost:3001'}/api/github/callback`;
+
+function generateStateToken(): string {
+  return Math.random().toString(36).substring(2) + Date.now().toString(36);
+}
+
+app.get("/api/github/auth", (req, res) => {
+  if (!GITHUB_CLIENT_ID) {
+    res.status(500).json({ error: "GitHub OAuth not configured" });
+    return;
+  }
+  
+  const state = generateStateToken();
+  res.cookie("oauth_state", state, { httpOnly: true, maxAge: 600000 });
+  
+  const params = new URLSearchParams({
+    client_id: GITHUB_CLIENT_ID,
+    redirect_uri: GITHUB_REDIRECT_URI,
+    scope: "repo user:email",
+    state,
+  });
+  res.redirect(`https://github.com/login/oauth/authorize?${params}`);
+});
+
+app.get("/api/github/callback", async (req, res) => {
+  const { code, state } = req.query;
+  const savedState = req.cookies.oauth_state;
+  
+  res.clearCookie("oauth_state");
+  
+  if (!state || state !== savedState) {
+    res.redirect("/app?error=invalid_state");
+    return;
+  }
+  
+  if (!code) {
+    res.redirect("/app?error=no_code");
+    return;
+  }
+  
+  try {
+    const tokenResponse = await fetch("https://github.com/login/oauth/access_token", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Accept: "application/json",
+      },
+      body: JSON.stringify({
+        client_id: GITHUB_CLIENT_ID,
+        client_secret: GITHUB_CLIENT_SECRET,
+        code,
+      }),
+    });
+    
+    const data = await tokenResponse.json() as any;
+    
+    if (data.error) {
+      res.redirect(`/app?error=${data.error_description || 'oauth_error'}`);
+      return;
+    }
+    
+    const accessToken = data.access_token;
+    res.cookie("github_token", accessToken, { 
+      httpOnly: true, 
+      maxAge: 30 * 24 * 60 * 60 * 1000,
+      sameSite: "lax",
+    });
+    
+    res.redirect("/app?logged_in=true");
+  } catch (error) {
+    console.error("[GitHub OAuth] Error:", error);
+    res.redirect("/app?error=oauth_failed");
+  }
+});
+
+app.get("/api/github/me", async (req, res) => {
+  const token = req.headers.authorization?.replace("Bearer ", "") || req.cookies.github_token || process.env.GITHUB_TOKEN;
+  
+  if (!token) {
+    res.status(401).json({ error: "Not authenticated", authenticated: false });
+    return;
+  }
+  
+  try {
+    const userResponse = await fetch("https://api.github.com/user", {
+      headers: {
+        Authorization: `token ${token}`,
+        Accept: "application/vnd.github.v3+json",
+      },
+    });
+    
+    if (!userResponse.ok) {
+      res.status(401).json({ error: "Invalid token", authenticated: false });
+      return;
+    }
+    
+    const user = await userResponse.json();
+    res.json({
+      authenticated: true,
+      user: {
+        id: user.id,
+        login: user.login,
+        name: user.name,
+        email: user.email,
+        avatar_url: user.avatar_url,
+      },
+    });
+  } catch (error) {
+    res.status(500).json({ error: "Failed to get user info" });
+  }
+});
+
+app.post("/api/github/logout", (_req, res) => {
+  res.clearCookie("github_token");
+  res.json({ success: true });
+});
+
+const clientDistPath = path.resolve(__dirname, "../../client/dist");
+const landingPath = path.resolve(__dirname, "landing.html");
+
+app.use("/app", express.static(clientDistPath));
+app.get("/app/*", (_req, res) => {
+  res.sendFile(path.join(clientDistPath, "index.html"));
+});
+
+function getGitHubToken(req: express.Request): string {
+  return req.headers.authorization?.replace("Bearer ", "") || req.cookies?.github_token || process.env.GITHUB_TOKEN || "";
+}
+
+app.post("/api/github/files", async (req, res) => {
+  const { githubUrl, path: filePath } = req.body as { githubUrl?: string; path?: string };
+  const token = getGitHubToken(req);
+
+  if (!token) {
+    res.status(401).json({ error: "GitHub token required. Set GITHUB_TOKEN or provide Bearer token." });
+    return;
+  }
+
+  if (!githubUrl) {
+    res.status(400).json({ error: "githubUrl is required" });
+    return;
+  }
+
+  try {
+    const { owner, repo } = parseGitHubRepoUrl(githubUrl);
+    const files = await listFiles(token, owner, repo, filePath || "");
+    res.json({ owner, repo, files });
+  } catch (error: any) {
+    console.error("[GitHub] List files error:", error.message);
+    res.status(500).json({ error: error.message || "Failed to list files" });
+  }
+});
+
+app.get("/api/github/file", async (req, res) => {
+  const { owner, repo, path: filePath } = req.query;
+  const token = getGitHubToken(req);
+
+  if (!token) {
+    res.status(401).json({ error: "GitHub token required" });
+    return;
+  }
+
+  if (!owner || !repo || !filePath) {
+    res.status(400).json({ error: "owner, repo, and path are required" });
+    return;
+  }
+
+  try {
+    const file = await getFileContent(token, owner as string, repo as string, filePath as string);
+    res.json(file);
+  } catch (error: any) {
+    console.error("[GitHub] Get file error:", error.message);
+    res.status(500).json({ error: error.message || "Failed to get file" });
+  }
+});
+
+app.post("/api/github/file", async (req, res) => {
+  const { owner, repo, path: filePath, content, message, branch, sha } = req.body;
+  const token = getGitHubToken(req);
+
+  if (!token) {
+    res.status(401).json({ error: "GitHub token required" });
+    return;
+  }
+
+  if (!owner || !repo || !filePath || !content || !message) {
+    res.status(400).json({ error: "owner, repo, path, content, and message are required" });
+    return;
+  }
+
+  try {
+    const result = await updateFile(token, owner, repo, filePath, content, message, branch || "main", sha) as any;
+    res.json(result);
+  } catch (error: any) {
+    console.error("[GitHub] Update file error:", error.message);
+    res.status(500).json({ error: error.message || "Failed to update file" });
+  }
+});
+
+app.post("/api/github/branch", async (req, res) => {
+  const { owner, repo, branchName, baseBranch } = req.body;
+  const token = getGitHubToken(req);
+
+  if (!token) {
+    res.status(401).json({ error: "GitHub token required" });
+    return;
+  }
+
+  if (!owner || !repo || !branchName) {
+    res.status(400).json({ error: "owner, repo, and branchName are required" });
+    return;
+  }
+
+  try {
+        const result = await createBranch(token, owner, repo, branchName, baseBranch || "main");
+    res.json(result);
+  } catch (error: any) {
+    console.error("[GitHub] Create branch error:", error.message);
+    res.status(500).json({ error: error.message || "Failed to create branch" });
+  }
+});
+
+app.post("/api/github/pr", async (req, res) => {
+  const { owner, repo, title, body, head, base } = req.body;
+  const token = getGitHubToken(req);
+
+  if (!token) {
+    res.status(401).json({ error: "GitHub token required" });
+    return;
+  }
+
+  if (!owner || !repo || !title || !head) {
+    res.status(400).json({ error: "owner, repo, title, and head are required" });
+    return;
+  }
+
+  try {
+    const result = await createPullRequest(token, owner, repo, title, body || "", head, base || "main") as any;
+    res.json({
+      number: result.number,
+      url: result.html_url,
+      title: result.title,
+      state: result.state,
+    });
+  } catch (error: any) {
+    console.error("[GitHub] Create PR error:", error.message);
+    res.status(500).json({ error: error.message || "Failed to create PR" });
+  }
+});
+
+app.post("/api/github/refactor", async (req, res) => {
+  const { githubUrl, instructions, branchName } = req.body as {
+    githubUrl?: string;
+    instructions?: string;
+    branchName?: string;
+  };
+  const token = getGitHubToken(req);
+
+  if (!token) {
+    res.status(401).json({ error: "GitHub token required" });
+    return;
+  }
+
+  if (!githubUrl || !instructions) {
+    res.status(400).json({ error: "githubUrl and instructions are required" });
+    return;
+  }
+
+  try {
+    const { owner, repo } = parseGitHubRepoUrl(githubUrl);
+    const newBranch = branchName || `cde-ai-refactor-${Date.now()}`;
+
+    res.write(JSON.stringify({ status: "analyzing", message: "Analyzing codebase..." }) + "\n");
+
+    const files = await listFiles(token, owner, repo, "");
+    const sourceExtensions = [".ts", ".tsx", ".js", ".jsx"];
+    
+    const targetDirs = ["vectron-app/server/src", "vectron-app/client/src"];
+    let jsFiles: { name: string; path: string; type: string }[] = [];
+    
+    for (const dir of targetDirs) {
+      try {
+        const subFiles = await listFiles(token, owner, repo, dir);
+        jsFiles.push(...subFiles.filter(f => f.type === "file" && sourceExtensions.some(ext => f.path.endsWith(ext))));
+      } catch {}
+    }
+    
+    if (jsFiles.length === 0) {
+      jsFiles = files
+        .filter(f => f.type === "file" && sourceExtensions.some(ext => f.path.endsWith(ext)))
+        .slice(0, 10);
+    }
+
+    res.write(JSON.stringify({ status: "analyzing", message: `Found ${jsFiles.length} source files...` }) + "\n");
+
+    const targetFile = jsFiles[0];
+    if (!targetFile) {
+      res.status(400).json({ error: "No JavaScript/TypeScript files found" });
+      return;
+    }
+
+    res.write(JSON.stringify({ status: "processing", message: `Analyzing ${targetFile.path}...` }) + "\n");
+
+    const fileContent = await getFileContent(token, owner, repo, targetFile.path) as any;
+    const fileContentStr = fileContent.content.slice(0, 5000);
+
+    const systemPrompt = `You are an expert code refactorer. Analyze the following code and make improvements based on the user's instructions.
+    
+Current instructions: ${instructions}
+    
+Respond with JSON only (no other text):
+{
+  "improvedCode": "the refactored code here",
+  "explanation": "brief explanation of changes"
+}`;
+    
+    res.write(JSON.stringify({ status: "refactoring", message: "Generating improved code..." }) + "\n");
+
+    const improvedResult = await callLLM(systemPrompt, fileContentStr);
+    let improvedCode = improvedResult.content;
+    let explanation = "Code refactored by CDE AI";
+
+    try {
+      const parsed = JSON.parse(improvedResult.content);
+      improvedCode = parsed.improvedCode || improvedCode;
+      explanation = parsed.explanation || explanation;
+    } catch {}
+
+    res.write(JSON.stringify({ status: "creating_branch", message: `Creating branch: ${newBranch}` }) + "\n");
+
+    await createBranch(token, owner, repo, newBranch, "main");
+
+    res.write(JSON.stringify({ status: "updating", message: "Applying changes..." }) + "\n");
+
+    await updateFile(token, owner, repo, targetFile.path, improvedCode, `Refactor: ${instructions}`, newBranch, fileContent.sha);
+
+    res.write(JSON.stringify({ status: "creating_pr", message: "Creating pull request..." }) + "\n");
+
+    const pr = await createPullRequest(
+      token,
+      owner, 
+      repo,
+      `CDE AI Refactor: ${instructions.slice(0, 50)}`,
+      `# Refactor Report\n\n**Instructions:** ${instructions}\n\n**File:** ${targetFile.path}\n\n**Explanation:** ${explanation}\n\nThis PR was automatically generated by CDE AI.`,
+      newBranch,
+      "main"
+    ) as any;
+
+    res.write(JSON.stringify({ 
+      status: "complete", 
+      pr: {
+        number: pr.number,
+        url: pr.html_url,
+        title: pr.title
+      }
+    }) + "\n");
+    res.end();
+  } catch (error: any) {
+    console.error("[GitHub] Refactor error:", error.message);
+    res.status(500).json({ error: error.message || "Failed to refactor" });
+  }
+});
+
+app.listen(PORT, () => {
+  console.log(`CDE AI server listening on port ${PORT}`);
+});
+
+startMCPServer();
